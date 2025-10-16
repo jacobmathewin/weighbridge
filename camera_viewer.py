@@ -7,6 +7,8 @@ import os
 from datetime import datetime
 from dotenv import load_dotenv
 from pymodbus.client import ModbusSerialClient
+import serial
+import re
 import time
 
 class CameraViewer:
@@ -26,9 +28,16 @@ class CameraViewer:
         # Video capture objects
         self.cap1 = None
         self.cap2 = None
+        # Latest frames and locks for safe capture
+        self.latest_frame1 = None
+        self.latest_frame2 = None
+        self.frame_lock1 = threading.Lock()
+        self.frame_lock2 = threading.Lock()
         
-        # Modbus client for weighbridge
+        # Weighbridge connections
         self.modbus_client = None
+        self.serial_conn = None
+        self.weighbridge_protocol = os.getenv("WEIGHBRIDGE_PROTOCOL", "modbus").strip().lower()
         self.weight_value = "0.00"
         self.weight_unit = "kg"
         self.is_weight_connected = False
@@ -59,12 +68,18 @@ class CameraViewer:
         return f"rtsp://{username}:{password}@{ip}:{port}/{stream_path}"
     
     def connect_weighbridge(self):
-        """Connect to weighbridge via Modbus"""
+        """Connect to weighbridge via Modbus or ASCII serial"""
         try:
             # Disconnect existing connection
             if self.modbus_client:
                 self.modbus_client.close()
                 self.modbus_client = None
+            if self.serial_conn:
+                try:
+                    self.serial_conn.close()
+                except Exception:
+                    pass
+                self.serial_conn = None
             
             port = self.weight_port.get().strip()
             baudrate = int(self.weight_baudrate.get().strip())
@@ -76,27 +91,56 @@ class CameraViewer:
             self.weight_status.config(text="Status: Connecting...", foreground="orange")
             self.root.update()
             
-            # Create Modbus client
-            self.modbus_client = ModbusSerialClient(
-                method='rtu',
-                port=port,
-                baudrate=baudrate,
-                timeout=1,
-                parity='N',
-                stopbits=1,
-                bytesize=8
-            )
-            
-            # Connect to device
-            if self.modbus_client.connect():
+            if self.weighbridge_protocol == "ascii":
+                # Serial ASCII mode (e.g., many scales)
+                parity = os.getenv("WEIGHBRIDGE_PARITY", "E").strip().upper()
+                bytesize = int(os.getenv("WEIGHBRIDGE_BYTESIZE", "7").strip())
+                stopbits = float(os.getenv("WEIGHBRIDGE_STOPBITS", "1").strip())
+                timeout = float(os.getenv("WEIGHBRIDGE_TIMEOUT", "0.5").strip())
+
+                parity_map = {"N": serial.PARITY_NONE, "E": serial.PARITY_EVEN, "O": serial.PARITY_ODD}
+                bytesize_map = {7: serial.SEVENBITS, 8: serial.EIGHTBITS}
+                stopbits_map = {1: serial.STOPBITS_ONE, 1.5: serial.STOPBITS_ONE_POINT_FIVE, 2: serial.STOPBITS_TWO}
+
+                self.serial_conn = serial.Serial(
+                    port=port,
+                    baudrate=baudrate,
+                    bytesize=bytesize_map.get(bytesize, serial.SEVENBITS),
+                    parity=parity_map.get(parity, serial.PARITY_EVEN),
+                    stopbits=stopbits_map.get(stopbits, serial.STOPBITS_ONE),
+                    timeout=timeout,
+                )
+
                 self.is_weight_connected = True
-                self.weight_status.config(text="Status: Connected", foreground="green")
-                
-                # Start weight reading thread
-                threading.Thread(target=self.read_weight_loop, daemon=True).start()
+                self.weight_status.config(text="Status: Connected (ASCII)", foreground="green")
+                threading.Thread(target=self.read_weight_ascii_loop, daemon=True).start()
             else:
-                self.weight_status.config(text="Status: Connection Failed", foreground="red")
-                messagebox.showerror("Error", f"Failed to connect to weighbridge on {port}")
+                # Modbus RTU mode
+                parity = os.getenv("WEIGHBRIDGE_PARITY", "N").strip().upper()
+                bytesize = int(os.getenv("WEIGHBRIDGE_BYTESIZE", "8").strip())
+                stopbits = int(float(os.getenv("WEIGHBRIDGE_STOPBITS", "1").strip()))
+                timeout = float(os.getenv("WEIGHBRIDGE_TIMEOUT", "1").strip())
+
+                self.modbus_client = ModbusSerialClient(
+                    method='rtu',
+                    port=port,
+                    baudrate=baudrate,
+                    timeout=timeout,
+                    parity=parity,
+                    stopbits=stopbits,
+                    bytesize=bytesize
+                )
+                
+                # Connect to device
+                if self.modbus_client.connect():
+                    self.is_weight_connected = True
+                    self.weight_status.config(text="Status: Connected (Modbus)", foreground="green")
+                    
+                    # Start weight reading thread
+                    threading.Thread(target=self.read_weight_loop, daemon=True).start()
+                else:
+                    self.weight_status.config(text="Status: Connection Failed", foreground="red")
+                    messagebox.showerror("Error", f"Failed to connect to weighbridge on {port}")
                 
         except Exception as e:
             self.weight_status.config(text="Status: Error", foreground="red")
@@ -108,24 +152,25 @@ class CameraViewer:
             try:
                 # Read holding registers (address 0, count 2) - adjust as needed for your device
                 # Common addresses for weight scales: 0, 1, or 40001, 40002
-                result = self.modbus_client.read_holding_registers(
-                    address=0,  # Starting address
-                    count=2,    # Number of registers to read
-                    unit=1      # Slave ID
-                )
+                address = int(os.getenv("WEIGHBRIDGE_ADDRESS", "0").strip())
+                count = int(os.getenv("WEIGHBRIDGE_COUNT", "2").strip())
+                unit = int(os.getenv("WEIGHBRIDGE_SLAVE_ID", "1").strip())
+                kind = os.getenv("WEIGHBRIDGE_KIND", "holding").strip().lower()
+
+                if kind == "input":
+                    result = self.modbus_client.read_input_registers(address=address, count=count, unit=unit)
+                else:
+                    result = self.modbus_client.read_holding_registers(address=address, count=count, unit=unit)
                 
                 if result.isError():
                     print(f"Modbus error: {result}")
                     time.sleep(1)
                     continue
                 
-                # Convert registers to weight value
-                # Assuming first register is weight integer part, second is decimal part
-                weight_int = result.registers[0] if len(result.registers) > 0 else 0
-                weight_decimal = result.registers[1] if len(result.registers) > 1 else 0
-                
-                # Combine integer and decimal parts
-                weight_value = weight_int + (weight_decimal / 100.0)
+                # Basic conversion: assume integer value; apply optional scale divisor
+                raw = result.registers[0] if len(result.registers) > 0 else 0
+                divisor = float(os.getenv("WEIGHBRIDGE_SCALE_DIVISOR", "1").strip())
+                weight_value = float(raw) / (divisor if divisor != 0 else 1)
                 
                 # Update weight display in main thread
                 self.root.after(0, lambda: self.update_weight_display(weight_value))
@@ -137,6 +182,47 @@ class CameraViewer:
                 time.sleep(1)
         
         # Connection lost
+        self.root.after(0, lambda: self.weight_status.config(text="Status: Disconnected", foreground="red"))
+
+    def read_weight_ascii_loop(self):
+        """Continuously read weight lines from ASCII serial device"""
+        line_regex = os.getenv("WEIGHBRIDGE_REGEX", r"([-+]?\d+(?:\.\d+)?)")
+        unit = os.getenv("WEIGHBRIDGE_UNIT", self.weight_unit)
+        decimals_env = os.getenv("WEIGHBRIDGE_DECIMALS", "auto").strip().lower()
+        divisor = float(os.getenv("WEIGHBRIDGE_SCALE_DIVISOR", "1").strip())
+
+        pattern = re.compile(line_regex)
+        while self.is_weight_connected and self.serial_conn:
+            try:
+                data = self.serial_conn.readline()
+                if not data:
+                    continue
+                try:
+                    text = data.decode(errors='ignore').strip()
+                except Exception:
+                    continue
+                m = pattern.search(text)
+                if not m:
+                    continue
+                value_str = m.group(1)
+                try:
+                    value = float(value_str)
+                except ValueError:
+                    continue
+                if divisor and divisor != 1:
+                    value = value / divisor
+                if decimals_env == "auto":
+                    display = f"{value:.2f}"
+                else:
+                    try:
+                        decimals = int(decimals_env)
+                        display = f"{value:.{decimals}f}"
+                    except Exception:
+                        display = f"{value:.2f}"
+                self.root.after(0, lambda d=display, u=unit: self.weight_display.config(text=f"Weight: {d} {u}"))
+            except Exception:
+                time.sleep(0.2)
+                continue
         self.root.after(0, lambda: self.weight_status.config(text="Status: Disconnected", foreground="red"))
     
     def update_weight_display(self, weight):
@@ -304,6 +390,14 @@ class CameraViewer:
         # Clear video displays
         self.camera1_label.config(text="Camera 1\nNot Connected", image="")
         self.camera2_label.config(text="Camera 2\nNot Connected", image="")
+        # Clear stored frames
+        try:
+            with self.frame_lock1:
+                self.latest_frame1 = None
+            with self.frame_lock2:
+                self.latest_frame2 = None
+        except Exception:
+            pass
     
     def disconnect_weighbridge(self):
         """Disconnect from weighbridge"""
@@ -312,6 +406,12 @@ class CameraViewer:
         if self.modbus_client:
             self.modbus_client.close()
             self.modbus_client = None
+        if self.serial_conn:
+            try:
+                self.serial_conn.close()
+            except Exception:
+                pass
+            self.serial_conn = None
         
         self.weight_status.config(text="Status: Disconnected", foreground="red")
         self.weight_display.config(text="Weight: 0.00 kg")
@@ -339,6 +439,12 @@ class CameraViewer:
             try:
                 ret, frame = self.cap1.read()
                 if ret:
+                    # Store original frame for capture
+                    try:
+                        with self.frame_lock1:
+                            self.latest_frame1 = frame.copy()
+                    except Exception:
+                        pass
                     # Get display size
                     display_width, display_height = self.get_display_size()
                     
@@ -378,6 +484,12 @@ class CameraViewer:
             try:
                 ret, frame = self.cap2.read()
                 if ret:
+                    # Store original frame for capture
+                    try:
+                        with self.frame_lock2:
+                            self.latest_frame2 = frame.copy()
+                    except Exception:
+                        pass
                     # Get display size
                     display_width, display_height = self.get_display_size()
                     
@@ -422,18 +534,20 @@ class CameraViewer:
         self.camera2_label.image = photo  # Keep a reference
     
     def capture_images(self):
-        """Capture images from both cameras"""
-        if not self.cap1 or not self.cap2:
+        """Capture images from both cameras using last safe frames"""
+        if not self.is_running:
             messagebox.showerror("Error", "Cameras not connected")
             return
         
         try:
-            # Get current frames
-            ret1, frame1 = self.cap1.read()
-            ret2, frame2 = self.cap2.read()
+            # Use frames stored by streaming threads to avoid concurrent reads
+            with self.frame_lock1:
+                frame1 = None if self.latest_frame1 is None else self.latest_frame1.copy()
+            with self.frame_lock2:
+                frame2 = None if self.latest_frame2 is None else self.latest_frame2.copy()
             
-            if not ret1 or not ret2:
-                messagebox.showerror("Error", "Failed to capture frames")
+            if frame1 is None or frame2 is None:
+                messagebox.showerror("Error", "No frames available to capture yet. Please try again.")
                 return
             
             # Generate timestamp for filenames
