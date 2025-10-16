@@ -1,0 +1,26 @@
+# Camera Configuration
+# Copy this file to .env and replace these values with your actual camera credentials
+
+# Camera 1 Settings
+CAMERA1_IP=192.168.1.100
+CAMERA1_USERNAME=admin
+CAMERA1_PASSWORD=password
+CAMERA1_PORT=554
+CAMERA1_STREAM_PATH=stream1
+
+# Camera 2 Settings
+CAMERA2_IP=192.168.1.101
+CAMERA2_USERNAME=admin
+CAMERA2_PASSWORD=password
+CAMERA2_PORT=554
+CAMERA2_STREAM_PATH=stream1
+
+# Alternative: You can also set full RTSP URLs directly
+# CAMERA1_RTSP_URL=rtsp://admin:password@192.168.1.100:554/stream1
+# CAMERA2_RTSP_URL=rtsp://admin:password@192.168.1.101:554/stream1
+
+# Weighbridge Configuration
+WEIGHBRIDGE_PORT=/dev/ttyUSB0
+WEIGHBRIDGE_BAUDRATE=9600
+WEIGHBRIDGE_SLAVE_ID=1
+WEIGHBRIDGE_ADDRESS=0
